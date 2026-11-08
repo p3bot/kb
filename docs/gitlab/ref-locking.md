@@ -449,7 +449,7 @@ Use the protocol from `docs/github/ref-locking.md` with these substitutions:
 | Acquire | REST create commit, then REST create ref | Create the commit locally, `git push origin <sha>:refs/locks/<id>` |
 | Renew or take over | REST create commit, then GraphQL `updateRefs` | Create the commit locally, `git push --force-with-lease=refs/locks/<id>:<old> origin <new>:refs/locks/<id>` |
 | Release | GraphQL `updateRefs` to zero | `git push --force-with-lease=refs/locks/<id>:<mine> origin :refs/locks/<id>` |
-| Checkin plus release | GraphQL `updateRefs` with two refs | `git push --atomic --force-with-lease=<branch>:<base> --force-with-lease=refs/locks/<id>:<mine> origin <new>:<branch> :refs/locks/<id>` |
+| Checkin plus release | GraphQL `updateRefs` with two refs | `git push --atomic --force-with-lease=<branch>:<head> --force-with-lease=refs/locks/<id>:<mine> origin <new>:<branch> :refs/locks/<id>`, where `<head>` is the branch head read just before building `<new>` on it; retry from the read if the head moved. L4 used one document, where head and base are the same commit |
 | Lease start time | Committer date set by GitHub | Not set by the server: lock commits are created by the client. Read the HTTP `Date` header of a GitLab API response immediately before the push and record it in the lock message (L11, G12) |
 
 Retry policy:
