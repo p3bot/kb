@@ -2,7 +2,7 @@
 
 Research into whether GitLab can act as the lock server for a git-backed document system, using git refs as compare-and-swap lock records. This repeats the GitHub research on GitLab.com.
 
-- Date: 2026-11-06
+- Date: 2026-11-06; lease clock follow-up (L11) 2026-11-08
 - Test project: `grantcarthew/ref-test` on GitLab.com (public, project ID 88596047)
 - Harness: `docs/gitlab/ref-lock-harness/`
 - Companion: `docs/github/ref-locking.md` (protocol, context and design decisions)
@@ -189,6 +189,7 @@ Differences:
 | L8 | Read-after-write consistency and latency | 30 writes | 0 stale | |
 | L9 | Ambiguous outcome, git push killed mid-flight | 12 + 18 | All resolved | |
 | L10 | Concurrent pushes to distinct refs | 8 x 8 | 21 spurious failures, 0 unsafe | |
+| L11 | Lease clock from the `Date` header | 20 iterations | 20/20 within 1 s | |
 | CI | Pipeline triggers from lock pushes | Deterministic | Recorded | |
 
 Totals: 80 races with exactly one winner each and the remote state matching, 0 safety anomalies. Start spread was at most 2 ms in every round.
@@ -304,6 +305,32 @@ Run 2, 18 iterations, kill after 1.0 to 1.75 s:
 
 Killed pushes were applied 15 of 15 times once the update had been sent. Both outcomes occur depending on timing, so a client cannot infer the result from its own failure. Read-back resolved every case with no inconsistency.
 
+### L11 Lease clock for git-transport lock commits
+
+Run 2026-11-08, about 06:48 to 06:50 UTC, from host gdc (Brisbane), Go 1.27.3, with a temporary personal access token (`api`, `write_repository`) read from a file. Git transport was HTTPS (username `oauth2`) with the token supplied by a credential helper, and git ran with `GIT_CONFIG_GLOBAL=/dev/null` and `GIT_CONFIG_NOSYSTEM=1`. Program: `docs/lease-clock-test/`, shared with the GitHub research (T16).
+
+Question: GitLab lock commits are created by the client, so the server sets no lease start. Is the HTTP `Date` header of a GitLab API response a sound lease clock?
+
+Each of 20 iterations:
+
+1. t0: `Date` header of REST `GET /repository/branches/main`
+2. Create a lock commit locally with `{"start":"<t0>"}` in the message and push it to `refs/locks/date-test` with `--force-with-lease`, timing the push
+3. t1: `Date` header of the same GET
+4. Server stamp: REST `POST /repository/commits` creating one file on a scratch branch `date-test`; compare the `committed_date` GitLab sets with that response's own `Date` header
+
+| Measure | Result |
+| --- | --- |
+| Server `committed_date` minus `Date` header | -1 s in 15, 0 s in 5; never more than 1 s |
+| t1 minus t0 | 1 to 3 s |
+| Lease push over HTTPS | 1.49 to 2.04 s |
+| `Date` going backwards between consecutive responses | 0 |
+| Local clock minus `Date` (read straight after the response) | 0.06 to 0.99 s |
+| Read-back of the lock ref after the last push | Matched |
+
+The `Date` header agrees with GitLab's commit clock within its 1 s resolution; the -1 s cases are the commit being stamped just before the response is sent. A lease start read from `Date` immediately before the push is earlier than the ref update by about the push time, so a lease measured from it expires slightly early, never late.
+
+A first attempt stopped at iteration 6 when the commits API returned `400 {"message":"4:Deadline Exceeded."}`. The program was changed to retry the stamp request with backoff and rerun; the results above are from the rerun, which needed no retries. The commits API is not part of the lock protocol, but the error is another transient GitLab failure that only a retry clears. The `date-test` branch and lock ref were deleted after both runs.
+
 ### CI pipeline triggers
 
 1. Commit `dd59570f` added `.gitlab-ci.yml` to `main` with one job (`rules: - when: always`). Pipeline `3036681309` ran for `main` (source `push`)
@@ -408,6 +435,10 @@ The API burst limit of 100 per minute was hit by the harness (L5). The documente
 
 LFS lock create is atomic (L7), and unlock by ID fences against releasing a newer lock. But locks belong to the user account, have no expiry, cannot carry holder metadata beyond the path, and cannot be combined with a content write.
 
+### G12 The Date header is a sound lease clock
+
+GitLab sets no time on client-created lock commits. The `Date` header of a GitLab API response matched GitLab's own `committed_date` within 1 s in 20 of 20 iterations and never went backwards (L11). Read immediately before the push, it puts the lease start 1 to 3 s before the ref update, which errs towards early expiry.
+
 ## Recommended GitLab Lock Driver
 
 Use the protocol from `docs/github/ref-locking.md` with these substitutions:
@@ -419,7 +450,7 @@ Use the protocol from `docs/github/ref-locking.md` with these substitutions:
 | Renew or take over | REST create commit, then GraphQL `updateRefs` | Create the commit locally, `git push --force-with-lease=refs/locks/<id>:<old> origin <new>:refs/locks/<id>` |
 | Release | GraphQL `updateRefs` to zero | `git push --force-with-lease=refs/locks/<id>:<mine> origin :refs/locks/<id>` |
 | Checkin plus release | GraphQL `updateRefs` with two refs | `git push --atomic --force-with-lease=<branch>:<base> --force-with-lease=refs/locks/<id>:<mine> origin <new>:<branch> :refs/locks/<id>` |
-| Lease start time | Committer date set by GitHub | Not set by the server: lock commits are created by the client. Use the HTTP `Date` header from a GitLab response at acquire time and record it in the lock message |
+| Lease start time | Committer date set by GitHub | Not set by the server: lock commits are created by the client. Read the HTTP `Date` header of a GitLab API response immediately before the push and record it in the lock message (L11, G12) |
 
 Retry policy:
 
@@ -467,7 +498,7 @@ GitLab lock mechanisms tested and not recommended:
 | Ambiguous outcomes | Yes (GraphQL, 12/12 applied after abort) | Yes (git, applied once the update is sent) |
 | Error text reliable | No (opaque GraphQL error) | No (misleading API error) |
 | Lock refs trigger CI | Untested | Custom refs no; branch locks yes |
-| Server-set lease timestamp | Yes (API-created commit) | No |
+| Server-set lease timestamp | Yes (API-created commit) | No; the `Date` header substitutes within 1 s (L11) |
 | Rate limit on lock traffic | 80 per minute content-generating (unconfirmed whether ref writes count) | 100 per minute API and 100 per minute git HTTPS (Free) |
 | LFS lock alternative | Untested | Works |
 
@@ -570,6 +601,8 @@ Exit codes: 0 when all checks pass, 1 when any anomaly is detected, 2 on a setup
 | l9 | `testAmbiguity` | 40 |
 | l10 | `testIndependent` | 200 |
 | cleanup | `cleanup` | 5 |
+
+L11 is a separate program, `docs/lease-clock-test/`, shared with the GitHub research (T16). Run it with `GL_TOKEN_FILE` set: `go run . gitlab`. It needs no askpass script, deletes `refs/locks/date-test` and the `date-test` branch when it finishes, and `go run . cleanup-gitlab` repeats the cleanup. About 20 API commits, 40 API reads and 20 git pushes.
 
 Warning: on GitLab Free, a full run is close to 1,000 requests, against a sustained limit of 5,000 per hour and a burst of 100 per minute. The budget paces the run to stay under the burst limit.
 

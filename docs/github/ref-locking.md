@@ -2,7 +2,7 @@
 
 Research into whether GitHub can act as the lock server for a git-backed document system, using git refs as compare-and-swap lock records.
 
-- Date: 2026-11-06
+- Date: 2026-11-06; lease clock follow-up (T16) 2026-11-08
 - Test repository: `grantcarthew/pentest` (public)
 - Harness: `docs/github/ref-lock-harness/`
 - Status: primitive validated; open items listed under Open Questions
@@ -55,7 +55,8 @@ Findings that shape the design:
 - GraphQL `updateRefs` failures are opaque: a compare-and-swap conflict and a server fault return the same "Something went wrong" message
 - GraphQL can write refs under `refs/locks/*` but cannot read them. Reads must use REST or `git ls-remote`
 - REST `PATCH` and `DELETE` on refs do not check the current value and must never be used for lock state
-- Git transport is correct but slow, about 3 s per push
+- Git transport is correct but slower: about 3 s per push over SSH, about 1.6 s over HTTPS (T16)
+- On git transport the client creates lock commits, so there is no server-set lease start; the `Date` header of an API response read before the push is a sound substitute (T16)
 
 ## Environment
 
@@ -204,6 +205,7 @@ Timing: REST create returning 422 took 0.88 s; REST GET ref took 0.47 s.
 | T13 | Ambiguous outcome after client abort | 12 | 12 resolved by read-back | | |
 | T14 | High contention, REST and GraphQL | 3 x 16 | 3/3 | 648 ms | 0 ms |
 | T15 | Side effects and costs | Observational | Recorded | | |
+| T16 | Lease clock for git-transport lock commits | 20 iterations | 20/20 within 1 s | | |
 
 Totals: 53 races, 392 contended operations, 0 anomalies.
 
@@ -368,6 +370,32 @@ Across T7 and T14, REST create won all 7 mixed rounds. REST reaches the arbiter 
 - Primary rate limits after all phase 2 tests: core 129 of 5000 used; GraphQL 10 of 5000 used (the GraphQL window may have reset during the run)
 - About 300 API mutations ran over roughly 20 minutes at up to 60 per minute, with no secondary rate-limit response
 
+### T16 Lease clock for git-transport lock commits
+
+Run 2026-11-08, about 06:46 to 06:47 UTC, from host gdc (Brisbane), Go 1.27.3, with the `GITHUB_TOKEN` classic token (scopes `read:org`, `repo`, `write:public_key`). Git transport was HTTPS with the token supplied by a credential helper, and git ran with `GIT_CONFIG_GLOBAL=/dev/null` and `GIT_CONFIG_NOSYSTEM=1` so the user's global URL rewrites and helpers could not interfere. Program: `docs/lease-clock-test/`.
+
+Question: when the client creates a lock commit itself (the git transport driver, including the GitHub fallback), there is no server-set committer date. Is the HTTP `Date` header of a GitHub API response a sound lease clock?
+
+Each of 20 iterations:
+
+1. t0: `Date` header of REST `GET /git/ref/heads/main`
+2. Create a lock commit locally with `{"start":"<t0>"}` in the message and push it to `refs/locks/date-test` with `--force-with-lease`, timing the push
+3. t1: `Date` header of the same GET
+4. Server stamp: REST `POST /git/commits` with no committer; compare the committer date GitHub sets with that response's own `Date` header
+
+| Measure | Result |
+| --- | --- |
+| Server committer date minus `Date` header | 0 s in 17, -1 s in 3; never more than 1 s |
+| t1 minus t0 | 1 to 2 s |
+| Lease push over HTTPS | 1.49 to 1.82 s |
+| `Date` going backwards between consecutive responses | 0 |
+| Local clock minus `Date` (read straight after the response) | 0.11 to 1.08 s |
+| Read-back of the lock ref after the last push | Matched |
+
+The `Date` header agrees with GitHub's commit clock within its 1 s resolution. A lease start read from `Date` immediately before the push is earlier than the ref update by about the push time, so a lease measured from it expires slightly early, never late. The local clock column is within the header's resolution plus response time on this host, so it shows the method rather than any skew.
+
+Git over HTTPS was about 1.6 s per push, against about 3 s over SSH in T12, because HTTPS avoids the SSH handshake.
+
 ### Harness defect found during testing
 
 The first run of T1 to T4 reported every round as an anomaly because the check also compared a GraphQL read of the ref, which always returned absent. Winner counts, `ls-remote` and REST were correct throughout. Investigation produced finding F3. The GraphQL read was removed from the checks and T1 to T4 were re-run; the results above are from the re-run.
@@ -408,11 +436,15 @@ A conflict returns HTTP 200 with a generic "Something went wrong" error and no `
 
 ### F9 Arbitration is fast for REST and slow for git
 
-REST won 7 of 7 mixed races, and deletes beat takeovers 4 of 4 (T4, T7, T14). Git transport costs about 3 s per write against about 1 s for GraphQL.
+REST won 7 of 7 mixed races, and deletes beat takeovers 4 of 4 (T4, T7, T14). Git transport costs about 3 s per write over SSH and about 1.6 s over HTTPS (T16), against about 1 s for GraphQL.
 
 ### F10 Lock refs are visible in public repos
 
 `git ls-remote` lists `refs/locks/*`, and the holder JSON is readable from the commit. Lock metadata in a public repo is public.
+
+### F11 The Date header is a sound lease clock for git transport
+
+A lock commit created by the client carries the client's clock. The `Date` header of a GitHub API response matched GitHub's own committer date within 1 s in 20 of 20 iterations and never went backwards (T16). Read immediately before the push, it puts the lease start 1 to 2 s before the ref update, which errs towards early expiry.
 
 ## Recommended Protocol
 
@@ -450,7 +482,8 @@ For checkin, read back both the content branch and the lock.
 
 ### Lease timing
 
-- Lease start: the committer date GitHub assigns to the lock commit (server clock), when the commit is created through the API without a committer
+- Lease start, API driver: the committer date GitHub assigns to the lock commit (server clock), when the commit is created through the API without a committer
+- Lease start, git transport fallback: the client creates the lock commit, so record the HTTP `Date` header of a GitHub API response read immediately before the push as the start in the lock message (T16, F11)
 - Lease length: stored in the lock commit message as a TTL
 - Expiry check: compare against GitHub's clock, taken from the HTTP `Date` response header, not the local clock, to avoid client clock skew
 - Holders renew before expiry. A takeover is a compare-and-swap against the expired commit, so only one taker can succeed
@@ -541,6 +574,8 @@ Location: `docs/github/ref-lock-harness/`
 | `.gitignore` | Ignores runtime artefacts `repo/` and `state.json` |
 
 T12 latency is measured inside T10 (`testConsistency`).
+
+T16 is a separate program, `docs/lease-clock-test/`, shared with the GitLab research (L11). Run it with `GITHUB_TOKEN` set: `go run . github`. It deletes `refs/locks/date-test` when it finishes; `go run . cleanup-github` repeats the cleanup. About 20 API writes and 20 git pushes.
 
 ### Requirements
 
