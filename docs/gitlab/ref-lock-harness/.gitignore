@@ -1,0 +1,3 @@
+# Runtime artefacts written by the harness
+/repo/
+/state.json
