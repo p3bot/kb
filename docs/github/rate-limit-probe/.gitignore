@@ -1,0 +1,4 @@
+# Runtime artefacts written by the probe when -work is the probe directory
+/repo/
+/probe.jsonl
+/control-issue

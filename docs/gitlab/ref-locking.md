@@ -499,7 +499,7 @@ GitLab lock mechanisms tested and not recommended:
 | Error text reliable | No (opaque GraphQL error) | No (misleading API error) |
 | Lock refs trigger CI | Untested | Custom refs no; branch locks yes |
 | Server-set lease timestamp | Yes (API-created commit) | No; the `Date` header substitutes within 1 s (L11) |
-| Rate limit on lock traffic | 80 per minute content-generating (unconfirmed whether ref writes count) | 100 per minute API and 100 per minute git HTTPS (Free) |
+| Rate limit on lock traffic | Primary 5000 per hour and 900 REST points per minute; ref, Git Data, and push writes do not count toward the content-generating limit (GitHub T17) | 100 per minute API and 100 per minute git HTTPS (Free) |
 | LFS lock alternative | Untested | Works |
 
 ## Open Questions

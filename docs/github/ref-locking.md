@@ -2,9 +2,9 @@
 
 Research into whether GitHub can act as the lock server for a git-backed document system, using git refs as compare-and-swap lock records.
 
-- Date: 2026-11-06; lease clock follow-up (T16) 2026-11-08
+- Date: 2026-11-06; lease clock follow-up (T16) 2026-11-08; rate-limit accounting (T17) 2026-11-15
 - Test repository: `grantcarthew/pentest` (public)
-- Harness: `docs/github/ref-lock-harness/`
+- Harness: `docs/github/ref-lock-harness/`; rate-limit probe `docs/github/rate-limit-probe/`
 - Status: primitive validated; open items listed under Open Questions
 - Companion: `docs/gitlab/ref-locking.md` (the same research on GitLab.com, with a GitHub comparison)
 
@@ -55,8 +55,9 @@ Findings that shape the design:
 - GraphQL `updateRefs` failures are opaque: a compare-and-swap conflict and a server fault return the same "Something went wrong" message
 - GraphQL can write refs under `refs/locks/*` but cannot read them. Reads must use REST or `git ls-remote`
 - REST `PATCH` and `DELETE` on refs do not check the current value and must never be used for lock state
-- Git transport is correct but slower: about 3 s per push over SSH, about 1.6 s over HTTPS (T16)
+- Git transport is correct but slower: about 3 s per push over SSH, 1.2 to 1.6 s over HTTPS (T16, T17)
 - On git transport the client creates lock commits, so there is no server-set lease start; the `Date` header of an API response read before the push is a sound substitute (T16)
+- Ref writes (REST and GraphQL `updateRefs`), Git Data object creates, and git pushes do not count toward the secondary content-generating limit of 80 per minute and 500 per hour; a control on issue comments tripped at exactly 500 (T17)
 
 ## Environment
 
@@ -206,6 +207,7 @@ Timing: REST create returning 422 took 0.88 s; REST GET ref took 0.47 s.
 | T14 | High contention, REST and GraphQL | 3 x 16 | 3/3 | 648 ms | 0 ms |
 | T15 | Side effects and costs | Observational | Recorded | | |
 | T16 | Lease clock for git-transport lock commits | 20 iterations | 20/20 within 1 s | | |
+| T17 | Secondary rate-limit accounting | 2,416 writes plus control | 0 refusals; control refused at 500 | | |
 
 Totals: 53 races, 392 contended operations, 0 anomalies.
 
@@ -396,6 +398,27 @@ The `Date` header agrees with GitHub's commit clock within its 1 s resolution. A
 
 Git over HTTPS was about 1.6 s per push, against about 3 s over SSH in T12, because HTTPS avoids the SSH handshake.
 
+### T17 Secondary rate-limit accounting
+
+Run 2026-11-15, 07:11 to 08:03 UTC, from host gdc (Brisbane), Go 1.27.3, against `grantcarthew/pentest` (public) with the `GITHUB_TOKEN` classic token (scopes `read:org`, `repo`, `write:public_key`). Git ran over HTTPS with the token in `http.extraHeader` through environment config, `GIT_CONFIG_GLOBAL=/dev/null` and `GIT_CONFIG_NOSYSTEM=1`. Program: `docs/github/rate-limit-probe/`.
+
+Question: do the writes a lock and checkin make count toward GitHub's secondary content-generating limit (80 per minute, 500 per hour)? `GET /rate_limit` reports primary limits only, so the only observable is a refusal. Each probe paced one write class at 60 per minute, under the per-minute limit, and ran past the hourly one. The probes ran back to back, so every write from p1 to p5 fell inside the hour before the control.
+
+| Probe | Write class | Writes | Duration | Result |
+| --- | --- | --- | --- | --- |
+| p1 | One exclusive one-shot metadata change on the API driver | 6 | | 6 writes; all succeeded and the read-back matched |
+| p2 | REST ref create and `DELETE`, alternating | 600 | 10 m 1 s | No refusal |
+| p3 | Git Data blob, tree, and commit creates, cycling | 600 | 10 m 0 s | No refusal |
+| p4 | GraphQL `updateRefs` create and delete, alternating | 600 | 10 m 4 s | No refusal |
+| p5 | `git push --atomic` create and delete over HTTPS, unpaced, then 10 REST ref writes | 610 | 12 m 24 s | No refusal |
+| p6 | Control: REST issue comments on one issue | 500 | 8 m 23 s | 499 created; the 500th refused with 403 "You have exceeded a secondary rate limit and have been temporarily blocked from content creation", no `Retry-After` |
+
+p1 counted the writes of one one-shot metadata change: create the lock commit (REST), create the lock ref (`updateRefs`, absent to commit), the row blob, one tree, the content commit, and one `updateRefs` moving the branch and deleting the lock. The tree is one call even for a row in a shard directory (`.docstore/.meta/a7/<id>.cue`), because a `base_tree` request takes a nested path.
+
+The control shows the probe detects the limit and that the earlier 2,416 writes were not counted against it: had any class counted, the comments would have been refused near the start, not at exactly 500. p5 pushes took 1.21 s on average and 1.97 s at most, faster than the 1.49 to 1.82 s in T16.
+
+Not covered: private repos, fine-grained tokens, and whether GitHub changes its accounting later. The primary limit (5000 requests per hour) and the REST points limit (900 per minute, 5 points per mutating request) still apply to these writes.
+
 ### Harness defect found during testing
 
 The first run of T1 to T4 reported every round as an anomaly because the check also compared a GraphQL read of the ref, which always returned absent. Winner counts, `ls-remote` and REST were correct throughout. Investigation produced finding F3. The GraphQL read was removed from the checks and T1 to T4 were re-run; the results above are from the re-run.
@@ -436,7 +459,7 @@ A conflict returns HTTP 200 with a generic "Something went wrong" error and no `
 
 ### F9 Arbitration is fast for REST and slow for git
 
-REST won 7 of 7 mixed races, and deletes beat takeovers 4 of 4 (T4, T7, T14). Git transport costs about 3 s per write over SSH and about 1.6 s over HTTPS (T16), against about 1 s for GraphQL.
+REST won 7 of 7 mixed races, and deletes beat takeovers 4 of 4 (T4, T7, T14). Git transport costs about 3 s per write over SSH and 1.2 to 1.6 s over HTTPS (T16, T17), against about 1 s for GraphQL.
 
 ### F10 Lock refs are visible in public repos
 
@@ -445,6 +468,10 @@ REST won 7 of 7 mixed races, and deletes beat takeovers 4 of 4 (T4, T7, T14). Gi
 ### F11 The Date header is a sound lease clock for git transport
 
 A lock commit created by the client carries the client's clock. The `Date` header of a GitHub API response matched GitHub's own committer date within 1 s in 20 of 20 iterations and never went backwards (T16). Read immediately before the push, it puts the lease start 1 to 2 s before the ref update, which errs towards early expiry.
+
+### F12 Lock and checkin writes do not spend the content-generating budget
+
+REST and GraphQL ref writes, Git Data object creates, and git pushes passed 600 each inside one hour with no refusal, while issue comments were refused at exactly 500 (T17). A lock cycle is bounded by the primary limit and the REST points limit, not by 500 per hour.
 
 ## Recommended Protocol
 
@@ -505,7 +532,7 @@ Constraint: each store is a GitHub repo, and a document's lock ref must live in 
 
 ### Write budget per operation
 
-Assuming every API write counts as a content-generating request, which is unverified:
+API writes per operation. T17 measured acquire and checkin together, 6 writes for a one-shot metadata change:
 
 | Operation | API writes |
 | --- | --- |
@@ -515,7 +542,7 @@ Assuming every API write counts as a content-generating request, which is unveri
 | Checkin of one changed file | 4 (blob, tree, commit, `updateRefs`) |
 | Full checkout, edit, checkin cycle | 6 |
 
-At GitHub's documented 80 per minute and 500 per hour, that is roughly 80 full document cycles per hour per account. Git transport writes are not believed to count towards the API limits.
+None of these writes count toward the content-generating limit of 80 per minute and 500 per hour (T17). The bounds are the primary 5000 requests per hour, shared with every read on the account, and 900 REST points per minute at 5 points per write: about 1,250 full cycles per hour on writes alone, less the reads. Git transport writes do not count toward the API limits (T17).
 
 ## Rate Limits Reference
 
@@ -527,7 +554,7 @@ Documented limits found during research (GitHub REST rate limit docs, retrieved 
 - Secondary: no more than 80 content-generating requests per minute, and no more than 500 per hour
 - Exceeding a limit returns 403 or 429, possibly with `Retry-After`. Continuing to send requests while limited can lead to a temporary or permanent ban of the integration or account
 
-It is unknown whether ref creates, ref updates and Git Data API object creation count as content-generating requests.
+Ref creates, ref updates, Git Data object creates, and git pushes do not count as content-generating requests (T17).
 
 ## Alternatives Considered
 
@@ -549,7 +576,6 @@ It is unknown whether ref creates, ref updates and Git Data API object creation 
 - Fine-grained tokens: verify the protocol works with a fine-grained personal access token limited to Contents read and write on the store repos
 - Actions and webhooks: verify whether pushes to `refs/locks/*` trigger `on: push` workflows or `push` webhooks. Repos with workflows could otherwise run CI on every lock operation
 - Rulesets and branch protection: verify that org or repo rulesets do not block `refs/locks/*` and do not interfere with atomic batches that include a protected branch
-- Secondary rate-limit accounting: confirm whether ref and Git Data writes count towards the limit of 80 per minute and 500 per hour, especially for busy ticket stores
 - Statistical confidence: 53 races cannot prove the absence of a race condition. Confidence also rests on the results matching git's transactional ref update semantics, which every interface evidently uses
 - Fairness: REST and deletes win arbitration systematically. Decide whether a GraphQL-only client needs randomised backoff to avoid starvation
 - Orphaned objects: every lock operation leaves an unreachable commit until GitHub's garbage collection removes it. They are tiny, but long-running busy stores should be monitored for repo size growth
@@ -574,6 +600,8 @@ Location: `docs/github/ref-lock-harness/`
 | `.gitignore` | Ignores runtime artefacts `repo/` and `state.json` |
 
 T12 latency is measured inside T10 (`testConsistency`).
+
+T17 is a separate program, `docs/github/rate-limit-probe/`. Run it from that directory with `gh` authenticated: `go run . -work <dir> p1` (6 writes), then `p2 p3 p4` (600 writes each, 10 minutes each), `p5` (600 git pushes and 10 API writes), `p6` (the control, which trips the account's content-creation limit for up to an hour), and `cleanup`. Each probe stops with exit code 3 at the first refusal. Logs go to `<dir>/probe.jsonl`.
 
 T16 is a separate program, `docs/lease-clock-test/`, shared with the GitLab research (L11). Run it with `GITHUB_TOKEN` set: `go run . github`. It deletes `refs/locks/date-test` when it finishes; `go run . cleanup-github` repeats the cleanup. About 20 API writes and 20 git pushes.
 
@@ -635,7 +663,7 @@ Exit codes: 0 when all checks pass, 1 when any anomaly is detected, 2 on a setup
 | t15 | `testSideEffects` | 1 |
 | cleanup | `cleanup` | 0 (git transport) |
 
-Warning: a full run is about 350 API writes. Do not run everything within one hour of other heavy API use; GitHub's documented hourly secondary limit is 500.
+Warning: a full run is about 350 API writes. Ref and Git Data writes do not count toward the hourly content-generating limit (T17), but the primary 5000 per hour is shared with other API use on the account.
 
 ## References
 
