@@ -2,9 +2,9 @@
 
 Research into whether GitHub can act as the lock server for a git-backed document system, using git refs as compare-and-swap lock records.
 
-- Date: 2026-11-06; lease clock follow-up (T16) 2026-11-08; rate-limit accounting (T17) 2026-11-15
-- Test repository: `grantcarthew/pentest` (public)
-- Harness: `docs/github/ref-lock-harness/`; rate-limit probe `docs/github/rate-limit-probe/`
+- Date: 2026-11-06; lease clock follow-up (T16) 2026-11-08; rate-limit accounting (T17) 2026-11-15; private repo and fine-grained tokens (T18), commit IDs (T19) 2026-11-19
+- Test repositories: `grantcarthew/pentest` (public); `grantcarthew/ref-lock-private` (private, T18 and T19)
+- Harness: `docs/github/ref-lock-harness/`; rate-limit probe `docs/github/rate-limit-probe/`; token probe `docs/github/token-probe/`; commit ID probe `docs/github/commit-id-probe/`
 - Status: primitive validated; open items listed under Open Questions
 - Companion: `docs/gitlab/ref-locking.md` (the same research on GitLab.com, with a GitHub comparison)
 
@@ -58,6 +58,9 @@ Findings that shape the design:
 - Git transport is correct but slower: about 3 s per push over SSH, 1.2 to 1.6 s over HTTPS (T16, T17)
 - On git transport the client creates lock commits, so there is no server-set lease start; the `Date` header of an API response read before the push is a sound substitute (T16)
 - Ref writes (REST and GraphQL `updateRefs`), Git Data object creates, and git pushes do not count toward the secondary content-generating limit of 80 per minute and 500 per hour; a control on issue comments tripped at exactly 500 (T17)
+- Everything holds on a private repo with a fine-grained token limited to that repo and Contents read and write: the full harness passed over HTTPS with 0 anomalies, and every lock and checkin operation succeeded (T18)
+- A write refused for lack of permission is distinguishable from a lost compare-and-swap: GraphQL returns a typed `FORBIDDEN` error, REST a 403, and git an HTTP 403 (T18)
+- The REST Git Data API keeps the object IDs of blobs, trees, and commits built locally with git, when the author and committer are given, in all 21 cases on both repos (T19)
 
 ## Environment
 
@@ -208,8 +211,10 @@ Timing: REST create returning 422 took 0.88 s; REST GET ref took 0.47 s.
 | T15 | Side effects and costs | Observational | Recorded | | |
 | T16 | Lease clock for git-transport lock commits | 20 iterations | 20/20 within 1 s | | |
 | T17 | Secondary rate-limit accounting | 2,416 writes plus control | 0 refusals; control refused at 500 | | |
+| T18 | Private repo, fine-grained tokens: T1 to T15 rerun, permission probe | 53 races; 2 tokens | All passed | 697 ms | 1 ms |
+| T19 | Commit IDs through the REST Git Data API | 21 cases x 2 repos | 42/42 identical | | |
 
-Totals: 53 races, 392 contended operations, 0 anomalies.
+Totals: 53 races, 392 contended operations, 0 anomalies on the public repo; the same again on the private repo (T18).
 
 ### T1 REST create race
 
@@ -419,6 +424,110 @@ The control shows the probe detects the limit and that the earlier 2,416 writes 
 
 Not covered: private repos, fine-grained tokens, and whether GitHub changes its accounting later. The primary limit (5000 requests per hour) and the REST points limit (900 per minute, 5 points per mutating request) still apply to these writes.
 
+### T18 Private repo and fine-grained tokens
+
+Run 2026-11-19, about 08:20 to 08:40 UTC, from host gdc (Brisbane), Go 1.27.3, against `grantcarthew/ref-lock-private`: private, created for this test and deleted after it, default branch `main` with one commit, no branch protection or rulesets. Programs: `docs/github/token-probe/`, and `docs/github/ref-lock-harness/` with `LOCKRACE_REPO`, `LOCKRACE_TOKEN_FILE`, and `LOCKRACE_GIT=https`.
+
+Question: does the protocol work in a private repo, the intended home for designs and tickets, with a fine-grained personal access token limited to the store repo? And what does a refusal look like when the token cannot write?
+
+Tokens, both fine-grained with repository access limited to `grantcarthew/ref-lock-private` and a 7-day expiry, deleted after the run:
+
+| Token | Repository permissions |
+| --- | --- |
+| A (write) | Contents: read and write; Metadata: read (added by GitHub) |
+| B (read-only) | Contents: read; Metadata: read (added by GitHub) |
+
+Git ran over HTTPS with the token in `http.extraHeader` through environment config, `GIT_CONFIG_GLOBAL=/dev/null` and `GIT_CONFIG_NOSYSTEM=1`. A baseline with the classic `gh` token (scopes `read:org`, `repo`, `write:public_key`) on the same repo matched token A in every operation.
+
+Permission probe. Each operation kb's drivers use, run once per token. The permission column is the `X-Accepted-GitHub-Permissions` response header; GraphQL and git send none:
+
+| Operation | Permission required | Token A | Token B |
+| --- | --- | --- | --- |
+| REST `GET /repos/{o}/{r}` | `metadata=read` | 200 | 200 |
+| REST `GET` ref, commit, contents | `contents=read` | 200 | 200 |
+| REST `GET /git/ref/locks/...` (read-back) | `contents=read` | 200 | |
+| GraphQL repository id | | ok | ok |
+| `git ls-remote`, `git fetch` | | ok, 0.5 to 0.6 s | ok, 0.5 s |
+| REST `POST` git commits, blobs, trees | `contents=write` | 201 | 403 `Resource not accessible by personal access token` |
+| REST `POST /git/refs` (acquire) | `contents=write`, or `contents=write,workflows=write` | 201 | 403, same message |
+| GraphQL `updateRefs` renew, create branch, atomic checkin | | applied | 200, `errors[0].type` `FORBIDDEN`, same message |
+| GraphQL `updateRefs` with a wrong `beforeOid` | | opaque "Something went wrong", no `type` | `FORBIDDEN` |
+| `git push` create, lease renew, atomic delete | | ok, 1.2 to 1.4 s | HTTP 403 `remote: Write access to repository not granted.`, 0.3 s |
+
+For ref creation the header lists two acceptable sets. Contents write alone was enough here; the second set presumably covers a ref whose commit changes `.github/workflows/`, which kb never writes (unverified).
+
+The repository's `permissions` field (`GET /repos/{o}/{r}`) reported `push: true` and `admin: true` for both tokens. It describes the user's role on the repo, not the token, so it cannot show whether a token can write.
+
+Harness rerun with token A, all tests, git over HTTPS:
+
+| Test | Rounds x racers | Correct | Min overlap | Notes |
+| --- | --- | --- | --- | --- |
+| T1 REST create race | 8 x 8 | 8/8 | 697 ms | Losers all 422 |
+| T2 GraphQL CAS race | 8 x 8 | 8/8 | 962 ms | |
+| T3 GraphQL create race | 4 x 8 | 4/4 | 950 ms | |
+| T4 Release vs takeover | 4 x 8 | 4/4 | 920 ms | A delete won every round again |
+| T5 git lease race | 8 x 8 | 8/8 | 1.224 s | Losers all `[remote rejected]` |
+| T6 git create race | 4 x 8 | 4/4 | 1.233 s | |
+| T7 Mixed interfaces | 4 x 9 | 4/4 | 718 ms | REST won every round again |
+| T8 Atomic multi-ref | Deterministic | 5/5 | | GraphQL and `git push --atomic` |
+| T9 and T9b Fencing | 2 checks; 10 x 2 | 2/2; 10/10 | 1.049 s | |
+| T10 Read after write | 30 writes | 0 stale | | REST and `ls-remote` |
+| T11 Error shapes | Deterministic | Same as public | | |
+| T13 Client abort | 12 | 12 applied, all resolved by read-back | | |
+| T14 High contention | 3 x 16 | 3/3 | 710 ms | REST won every round |
+
+Latency (T12, inside T10), with git over HTTPS rather than SSH:
+
+| Operation | n | p50 | p95 | Max |
+| --- | --- | --- | --- | --- |
+| REST GET ref | 30 | 397 ms | 474 ms | 481 ms |
+| REST create commit | 5 | 607 ms | 684 ms | 684 ms |
+| GraphQL `updateRefs` | 30 | 1.192 s | 1.591 s | 2.514 s |
+| `git ls-remote` | 30 | 522 ms | 624 ms | 944 ms |
+| `git push --force-with-lease` | 10 | 1.391 s | 1.636 s | 1.636 s |
+
+`git ls-remote` over HTTPS is about 5 times faster than the 2.45 s over SSH in T12. The API figures are 50 to 250 ms slower than on 2026-11-06, within run-to-run variation from Brisbane; this run was not designed to compare the two repos' latency. T15: no events in the repo events feed; primary use after the run was 145 of 5000 core and 2 of 5000 GraphQL.
+
+### T19 Commit IDs through the REST Git Data API
+
+Run 2026-11-19, about 08:00 to 08:20 UTC, from host gdc, Go 1.27.3, with the classic `gh` token, against `grantcarthew/pentest` (public) and `grantcarthew/ref-lock-private` (private). Program: `docs/github/commit-id-probe/`.
+
+Question: kb's API driver builds every commit in its clone with git, uploads the same blobs, tree, and commit through REST, and moves the branch with `updateRefs`. Its clone holds its own writes without a fetch only if GitHub returns the IDs git computed. Does it?
+
+Each case builds blobs, a tree (through a temporary index), and a commit (`git commit-tree`, author and committer set through the environment, message from stdin) locally, then the same through REST: `POST /git/blobs` (base64 unless noted), `POST /git/trees` with `base_tree` and the changed paths, and `POST /git/commits` with explicit author and committer, each with an ISO 8601 date carrying its offset. It compares every blob, tree, and commit ID. Delete and move cases first build a known base tree (two documents, an attachment, and rows in two shards) on top of `main`, both ways.
+
+| Case | What it varies | Public | Private |
+| --- | --- | --- | --- |
+| basic | One nested file on `base_tree`, +10:00, message ends in a newline | same | same |
+| no-newline | Message without a trailing newline | same | same |
+| multiline | Subject, body, blank lines, trailing spaces, trailers | same | same |
+| crlf-message | CR LF line endings in the message | same | same |
+| leading-blank | Message starting with blank lines | same | same |
+| unicode | Non-ASCII author name, email, and message | same | same |
+| offsets | Author +05:30, committer -05:00, different identities | same | same |
+| utc | Dates in UTC | same | same |
+| old-date | Author date in 2001, committer now | same | same |
+| checkin-shape | Body, row in a shard directory, 4 KB binary attachment in one tree | same | same |
+| exec-mode | Mode 100755 | same | same |
+| crlf-utf8 | CR LF content, no final newline, `encoding: utf-8` | same | same |
+| crlf-base64 | The same content as base64 | same | same |
+| empty-file | Zero-byte file | same | same |
+| delete | Delete a file (`sha: null`); its directory keeps other files | same | same |
+| delete-prune | Delete the only row in a shard directory | same | same |
+| delete-prune2 | Delete every row, emptying `.meta/` | same | same |
+| move | Move a document and its attachment to another directory in one tree | same | same |
+| root | No parents, nested paths, no `base_tree` | same | same |
+| merge | Two parents | same | same |
+| no-committer | Committer omitted | same | same |
+
+All 42 commit IDs, and every blob and tree ID, were identical. Observations:
+
+- GitHub keeps the message bytes exactly: no trailing newline is added or stripped, and CR LF and leading blank lines survive
+- The commit keeps each date's offset, though the API's JSON response reports dates in UTC (`2026-11-19T08:04:52Z` for a +10:00 date). A commit rebuilt from the JSON would have a different ID; only the IDs are comparable
+- A directory emptied by deletes is pruned from the tree exactly as git prunes it
+- With the committer omitted, GitHub uses the author, date included, so the ID still matched. With an explicit author, GitHub does not sign the commit (`verification.reason` `unsigned`)
+- A tree that would leave the whole repo empty is refused with 404 `Not Found`, and an empty tree with no base with 422 `Invalid tree info`. Neither can occur in a store, whose `.docstore/config.cue` always exists. Deleting a path absent from the base tree returns 422 `GitRPC::BadObjectState` (both found by hand on the private repo, outside the probe)
+
 ### Harness defect found during testing
 
 The first run of T1 to T4 reported every round as an anomaly because the check also compared a GraphQL read of the ref, which always returned absent. Winner counts, `ls-remote` and REST were correct throughout. Investigation produced finding F3. The GraphQL read was removed from the checks and T1 to T4 were re-run; the results above are from the re-run.
@@ -473,6 +582,18 @@ A lock commit created by the client carries the client's clock. The `Date` heade
 
 REST and GraphQL ref writes, Git Data object creates, and git pushes passed 600 each inside one hour with no refusal, while issue comments were refused at exactly 500 (T17). A lock cycle is bounded by the primary limit and the REST points limit, not by 500 per hour.
 
+### F13 Private repos and fine-grained tokens change nothing
+
+Every race, the atomic and fencing checks, read-after-write, and client-abort resolution gave the same results on a private repo with a fine-grained token limited to Contents read and write on that one repo (T18). That is the minimum token for a store kb writes; Contents read-only is enough for a store it only reads.
+
+### F14 Permission refusals are typed
+
+A token without write access gets a GraphQL error with `type` `FORBIDDEN`, a REST 403, or a git HTTP 403, all before any ref changes. A lost compare-and-swap stays an untyped "Something went wrong" (F7). A client can treat a typed refusal as final and does not need a read-back to tell it from a lost race. The repository's `permissions` field reports the user's role, not the token's, so the only way to learn whether a token can write is to attempt a harmless write, such as creating a blob (T18).
+
+### F15 The Git Data API keeps locally built object IDs
+
+Blobs, trees, and commits created through REST with an explicit author and committer get the IDs git computes for the same content, across message forms, offsets, modes, binary and empty files, deletes that prune directories, and root and merge commits (T19). A client can build commits in its own clone, upload them, and know its clone already holds what it wrote.
+
 ## Recommended Protocol
 
 ### Operations
@@ -506,6 +627,8 @@ default:                            // someone else changed it
 For a delete (`afterOid` zero), "landed" means the ref is absent. If another process deleted and re-created the ref in between, the default branch handles it because the object ID differs.
 
 For checkin, read back both the content branch and the lock.
+
+A typed refusal (GraphQL `FORBIDDEN`, REST 403, git HTTP 403) is not a transient fault and is not retried: the token cannot write, and the ref is unchanged (F14).
 
 ### Lease timing
 
@@ -572,8 +695,6 @@ Ref creates, ref updates, Git Data object creates, and git pushes do not count a
 
 ## Open Questions
 
-- Private repo behaviour: all tests ran on a public repo. Re-run the harness against a private repo, which is the intended home for documents and tickets
-- Fine-grained tokens: verify the protocol works with a fine-grained personal access token limited to Contents read and write on the store repos
 - Actions and webhooks: verify whether pushes to `refs/locks/*` trigger `on: push` workflows or `push` webhooks. Repos with workflows could otherwise run CI on every lock operation
 - Rulesets and branch protection: verify that org or repo rulesets do not block `refs/locks/*` and do not interfere with atomic batches that include a protected branch
 - Statistical confidence: 53 races cannot prove the absence of a race condition. Confidence also rests on the results matching git's transactional ref update semantics, which every interface evidently uses
@@ -603,12 +724,16 @@ T12 latency is measured inside T10 (`testConsistency`).
 
 T17 is a separate program, `docs/github/rate-limit-probe/`. Run it from that directory with `gh` authenticated: `go run . -work <dir> p1` (6 writes), then `p2 p3 p4` (600 writes each, 10 minutes each), `p5` (600 git pushes and 10 API writes), `p6` (the control, which trips the account's content-creation limit for up to an hour), and `cleanup`. Each probe stops with exit code 3 at the first refusal. Logs go to `<dir>/probe.jsonl`.
 
+T18 reruns this harness against another repo with a fine-grained token over HTTPS, set through the environment (see Configuration), and adds `docs/github/token-probe/`: `go run . -repo owner/name -token-file <path> [-label name] run`, then `cleanup` to delete its refs. `-token-file gh` uses the `gh` token. About 20 API calls; it writes `refs/locks/token-probe`, `refs/locks/token-probe-git`, and `refs/heads/token-probe-content`, and leaves the branch for `cleanup`. Logs go to `work/probe.jsonl`.
+
+T19 is `docs/github/commit-id-probe/`: `go run . [-repo owner/name] [-token-file <path>] [case...]`, token from `-token-file`, else `GITHUB_TOKEN`, else `gh`. About 90 Git Data writes for all cases; it creates no refs, so its objects stay unreferenced. Exit code 1 when any ID differs. Logs go to `work/probe.jsonl`.
+
 T16 is a separate program, `docs/lease-clock-test/`, shared with the GitLab research (L11). Run it with `GITHUB_TOKEN` set: `go run . github`. It deletes `refs/locks/date-test` when it finishes; `go run . cleanup-github` repeats the cleanup. About 20 API writes and 20 git pushes.
 
 ### Requirements
 
-- `gh` CLI authenticated with `repo` scope; the token is read through `gh auth token` and never printed
-- SSH access to the target repo for git transport
+- `gh` CLI authenticated with `repo` scope; the token is read through `gh auth token` and never printed. With `LOCKRACE_TOKEN_FILE`, the token is read from that file instead
+- SSH access to the target repo for git transport, unless `LOCKRACE_GIT=https`
 - Push access to the target repo; the harness creates and deletes refs there
 - Go 1.27.1 or newer, as declared in `go.mod` (the code itself needs only Go 1.22 or newer for `for range n`, so lowering the `go` directive is safe)
 
@@ -624,6 +749,14 @@ Edit the constants at the top of `main.go`:
 | `perMin` | 60 | Self-imposed API mutation budget per rolling minute |
 
 `rounds` (8) and `racers` (8) are set further down, above the tests.
+
+Environment overrides (T18):
+
+| Variable | Effect |
+| --- | --- |
+| `LOCKRACE_REPO` | `owner/name` of the target repo; state and the local repo go to `state-<owner>-<name>.json` and `repo-<owner>-<name>/` |
+| `LOCKRACE_TOKEN_FILE` | Read the token from this file instead of `gh auth token` |
+| `LOCKRACE_GIT` | `https` runs git over HTTPS with the token in `http.extraHeader` and an isolated git config, instead of SSH |
 
 ### Running
 

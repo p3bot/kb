@@ -3,6 +3,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,9 +17,17 @@ import (
 	"time"
 )
 
+// owner and repo default to the public test repo. LOCKRACE_REPO=owner/name
+// overrides them; LOCKRACE_TOKEN_FILE supplies a token instead of gh, and
+// LOCKRACE_GIT=https runs git over HTTPS with that token instead of SSH.
+var (
+	owner     = "grantcarthew"
+	repo      = "pentest"
+	gitHTTPS  bool
+	tokenFile string
+)
+
 const (
-	owner   = "grantcarthew"
-	repo    = "pentest"
 	poolN   = 40
 	perMin  = 60 // self-imposed API mutation budget per rolling minute
 	zeroOID = "0000000000000000000000000000000000000000"
@@ -183,6 +192,16 @@ func git(args ...string) (string, error) {
 	cmd := exec.Command("git", args...)
 	cmd.Dir = gitDir
 	cmd.Env = append(os.Environ(), "GIT_SSH_COMMAND="+gitSSH, "GIT_TERMINAL_PROMPT=0")
+	if gitHTTPS {
+		basic := base64.StdEncoding.EncodeToString([]byte("x-access-token:" + token))
+		cmd.Env = append(cmd.Env,
+			"GIT_CONFIG_NOSYSTEM=1",
+			"GIT_CONFIG_GLOBAL=/dev/null",
+			"GIT_CONFIG_COUNT=1",
+			"GIT_CONFIG_KEY_0=http.https://github.com/.extraHeader",
+			"GIT_CONFIG_VALUE_0=Authorization: Basic "+basic,
+		)
+	}
 	out, err := cmd.CombinedOutput()
 	return strings.TrimSpace(string(out)), err
 }
@@ -700,7 +719,13 @@ func testErrors() {
 }
 
 func setup() {
-	out, err := exec.Command("gh", "auth", "token").Output()
+	var out []byte
+	var err error
+	if tokenFile != "" {
+		out, err = os.ReadFile(tokenFile)
+	} else {
+		out, err = exec.Command("gh", "auth", "token").Output()
+	}
 	must(err)
 	token = strings.TrimSpace(string(out))
 	if len(st.Pool) == poolN {
@@ -708,7 +733,11 @@ func setup() {
 	}
 	_, err = git("init", "-q")
 	must(err)
-	_, _ = git("remote", "add", "origin", fmt.Sprintf("git@github.com:%s/%s.git", owner, repo))
+	remote := fmt.Sprintf("git@github.com:%s/%s.git", owner, repo)
+	if gitHTTPS {
+		remote = fmt.Sprintf("https://github.com/%s/%s.git", owner, repo)
+	}
+	_, _ = git("remote", "add", "origin", remote)
 	_, err = git("fetch", "-q", "origin", "main")
 	must(err)
 	st.Tree, err = git("rev-parse", "FETCH_HEAD^{tree}")
@@ -755,6 +784,17 @@ func main() {
 	base, _ = os.Getwd()
 	gitDir = filepath.Join(base, "repo")
 	stPath = filepath.Join(base, "state.json")
+	if r := os.Getenv("LOCKRACE_REPO"); r != "" {
+		o, n, ok := strings.Cut(r, "/")
+		if !ok {
+			must(fmt.Errorf("LOCKRACE_REPO must be owner/name, got %q", r))
+		}
+		owner, repo = o, n
+		gitDir = filepath.Join(base, "repo-"+o+"-"+n)
+		stPath = filepath.Join(base, "state-"+o+"-"+n+".json")
+	}
+	tokenFile = os.Getenv("LOCKRACE_TOKEN_FILE")
+	gitHTTPS = os.Getenv("LOCKRACE_GIT") == "https"
 	must(os.MkdirAll(gitDir, 0o755))
 	gitSSH = "ssh"
 	loadState()
